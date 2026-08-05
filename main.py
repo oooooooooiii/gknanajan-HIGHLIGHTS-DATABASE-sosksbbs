@@ -4,11 +4,35 @@ import os
 import re
 import requests
 
-FIREBASE_URL = os.environ.get("FIREBASE_URL", "")
-FIREBASE_SECRET = os.environ.get("FIREBASE_SECRET", "")
+FIREBASE_URL = os.environ.get("FIREBASE_URL")
+FIREBASE_SECRET = os.environ.get("FIREBASE_SECRET")
 API_BASE_URL = os.environ.get("API_BASE_URL")
 
 CHECKPOINT_FILE = "last_match.json"
+
+
+def normalize_string(text):
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")
+
+
+def format_date_part(date_str):
+    if not date_str:
+        return ""
+    try:
+        dt = datetime.strptime(str(date_str).strip(), "%b %d, %Y")
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return normalize_string(date_str)
+
+
+def make_slug(title, date_str):
+    clean_t = normalize_string(title)
+    clean_d = format_date_part(date_str)
+    if clean_d:
+        return f"{clean_t}-{clean_d}"
+    return clean_t
 
 
 def clean_firebase_key(text):
@@ -34,31 +58,45 @@ def sanitize_deep_json(obj):
         return obj
 
 
-def make_slug(title, date_str):
-    clean_title = re.sub(r"[^a-z0-9]+", "-", str(title).lower()).strip("-")
-    formatted_date = ""
-    if date_str:
-        try:
-            dt = datetime.strptime(date_str.strip(), "%b %d, %Y")
-            formatted_date = dt.strftime("%Y-%m-%d")
-        except Exception:
-            formatted_date = re.sub(r"[^a-z0-9]+", "-", str(date_str).lower()).strip("-")
-    if formatted_date:
-        return f"{clean_title}-{formatted_date}"
-    return clean_title
-
-
 def get_last_checkpoint():
     if not os.path.exists(CHECKPOINT_FILE):
-        return ""
+        return "", "", ""
     try:
         with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, list) and len(data) > 0:
-                return data[0].get("last_slug", "").strip()
+                item = data[0]
+                return (
+                    item.get("last_slug", "").strip(),
+                    item.get("title", "").strip(),
+                    item.get("date", "").strip(),
+                )
     except Exception:
         pass
-    return ""
+    return "", "", ""
+
+
+def is_checkpoint_match(m_slug, m_title, m_date, chk_slug, chk_title, chk_date):
+    if not chk_slug and not chk_title:
+        return False
+
+    if chk_slug and m_slug == chk_slug:
+        return True
+
+    norm_m_title = normalize_string(m_title)
+    norm_c_title = normalize_string(chk_title)
+    norm_m_date = format_date_part(m_date)
+    norm_c_date = format_date_part(chk_date)
+
+    if norm_m_title and norm_m_title == norm_c_title:
+        if not norm_c_date or norm_m_date == norm_c_date:
+            return True
+
+    if chk_slug and (chk_slug in m_slug or m_slug in chk_slug):
+        if norm_m_date and norm_c_date and norm_m_date == norm_c_date:
+            return True
+
+    return False
 
 
 def save_last_checkpoint(match_obj):
@@ -75,54 +113,19 @@ def save_last_checkpoint(match_obj):
             "title": title,
             "team1_name": home_team,
             "team2_name": away_team,
-            "date": date_str
+            "date": date_str,
         }
     ]
     with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
         json.dump(checkpoint_data, f, indent=2, ensure_ascii=False)
 
 
-def fetch_new_matches(checkpoint_slug):
-    all_fetched = []
-    checkpoint_found = False
-    current_page = 1
-    max_page = 1
-
-    while current_page <= max_page:
-        if current_page == 1:
-            url = f"{API_BASE_URL.rstrip('/')}/data.json"
-        else:
-            url = f"{API_BASE_URL.rstrip('/')}/data_page_{current_page - 1}.json"
-
-        try:
-            res = requests.get(url, timeout=30)
-            if res.status_code != 200:
-                break
-            content = res.json()
-            matches = content.get("matches", [])
-            max_page = content.get("lastPage", max_page)
-
-            for m in matches:
-                slug = make_slug(m.get("title", ""), m.get("date", ""))
-                if checkpoint_slug and slug == checkpoint_slug:
-                    checkpoint_found = True
-                    break
-                all_fetched.append((slug, m))
-
-            if checkpoint_found:
-                break
-
-            current_page += 1
-        except Exception as err:
-            print(f"Error fetching page {current_page}: {err}")
-            break
-
-    return all_fetched
-
-
 def upload_to_firebase(new_matches_list):
     if not new_matches_list:
-        print("No new matches to upload.")
+        return False
+
+    if not FIREBASE_URL or not FIREBASE_SECRET:
+        print("[!] Error: FIREBASE_URL or FIREBASE_SECRET environment variable is missing!")
         return False
 
     firebase_payload = {}
@@ -143,38 +146,95 @@ def upload_to_firebase(new_matches_list):
                 target_endpoint,
                 data=json.dumps(batch_dict, ensure_ascii=False),
                 headers={"Content-Type": "application/json"},
-                timeout=35
+                timeout=35,
             )
             if res.status_code == 200:
                 success_count += len(batch_dict)
-                print(f"Batch {i+1}/{total_batches} uploaded successfully ({len(batch_dict)} matches)")
             else:
-                print(f"Batch {i+1} failed with status: {res.status_code}")
+                print(f"[!] Firebase batch {i+1} failed with status code: {res.status_code}")
         except Exception as e:
-            print(f"Network error on batch {i+1}: {e}")
+            print(f"[!] Network error on Firebase batch {i+1}: {e}")
 
-    return success_count > 0
+    return success_count == len(items)
 
 
 def main():
-    if not FIREBASE_URL or not FIREBASE_SECRET:
-        print("Error: FIREBASE_URL or FIREBASE_SECRET environment variables are missing.")
+    now_str = datetime.now().strftime("%I:%M:%S %p %d-%m-%Y")
+    print("==========================================")
+    print(f" ReFooty Live Tracker Started: {now_str}")
+    print("==========================================")
+
+    if not FIREBASE_URL or not FIREBASE_SECRET or not API_BASE_URL:
+        print("[!] Error: Required environment variables (FIREBASE_URL, FIREBASE_SECRET, API_BASE_URL) are missing!")
         return
 
-    last_slug = get_last_checkpoint()
-    print(f"Last Checkpoint Slug: '{last_slug}'")
-
-    new_matches = fetch_new_matches(last_slug)
-    print(f"Total new matches found: {len(new_matches)}")
-
-    if new_matches:
-        uploaded = upload_to_firebase(new_matches)
-        if uploaded:
-            newest_match = new_matches[0][1]
-            save_last_checkpoint(newest_match)
-            print("Checkpoint updated successfully in last_match.json")
+    chk_slug, chk_title, chk_date = get_last_checkpoint()
+    if chk_slug or chk_title:
+        print(f"[+] Loaded local checkpoint: Slug='{chk_slug}', Title='{chk_title}'")
     else:
-        print("Database is up to date.")
+        print("[!] No valid local checkpoint found. Preparing initial scan.")
+
+    print("[-] Checking ReFooty API for new matches...")
+
+    all_new_matches = []
+    checkpoint_matched = False
+    matched_title = ""
+    matched_slug = ""
+    current_page = 1
+    max_page = 1
+    base = API_BASE_URL.rstrip('/')
+
+    while current_page <= max_page:
+        print(f"[*] Fetching API page {current_page}...")
+        if current_page == 1:
+            url = f"{base}/data.json"
+        else:
+            url = f"{base}/data_page_{current_page - 1}.json"
+
+        try:
+            res = requests.get(url, timeout=30)
+            if res.status_code != 200:
+                print(f"[!] Error fetching API page {current_page}: Status {res.status_code}")
+                break
+
+            content = res.json()
+            matches = content.get("matches", [])
+            max_page = content.get("lastPage", max_page)
+
+            for m in matches:
+                m_title = m.get("title", "")
+                m_date = m.get("date", "")
+                m_slug = make_slug(m_title, m_date)
+
+                if is_checkpoint_match(m_slug, m_title, m_date, chk_slug, chk_title, chk_date):
+                    checkpoint_matched = True
+                    matched_title = m_title
+                    matched_slug = m_slug
+                    break
+
+                all_new_matches.append((m_slug, m))
+
+            if checkpoint_matched:
+                print(f"\n[+] MATCHED LAST CHECKPOINT: '{matched_title}' ({matched_slug})!")
+                print("[+] Stopping API scan immediately.")
+                break
+
+            current_page += 1
+        except Exception as err:
+            print(f"[!] Error processing API page {current_page}: {err}")
+            break
+
+    total_new = len(all_new_matches)
+    if total_new > 0:
+        uploaded = upload_to_firebase(all_new_matches)
+        if uploaded:
+            newest_match = all_new_matches[0][1]
+            save_last_checkpoint(newest_match)
+            print(f"[+] Total {total_new} match successfully added in database\n")
+        else:
+            print("[!] Failed to upload matches to database. Checkpoint not updated.")
+    else:
+        print("[+] No new matches found. Database is up to date.\n")
 
 
 if __name__ == "__main__":
