@@ -35,6 +35,19 @@ def make_slug(title, date_str):
     return clean_t
 
 
+def parse_date(date_str):
+    if not date_str:
+        return datetime.min
+    date_str = str(date_str).strip()
+    formats = ["%b %d, %Y", "%B %d, %Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            pass
+    return datetime.min
+
+
 def clean_firebase_key(text):
     if not text:
         return "clean_key"
@@ -120,42 +133,63 @@ def save_last_checkpoint(match_obj):
         json.dump(checkpoint_data, f, indent=2, ensure_ascii=False)
 
 
-def upload_to_firebase(new_matches_list):
-    if not new_matches_list:
-        return False
-
+def sync_and_sort_firebase(new_matches_list):
     if not FIREBASE_URL or not FIREBASE_SECRET:
         print("[!] Error: FIREBASE_URL or FIREBASE_SECRET environment variable is missing!")
-        return False
+        return False, None
 
-    firebase_payload = {}
-    for slug, m in new_matches_list:
-        safe_m = sanitize_deep_json(m)
-        firebase_payload[slug] = safe_m
+    endpoint = f"{FIREBASE_URL.rstrip('/')}/Highlights/matches.json?auth={FIREBASE_SECRET}"
 
-    target_endpoint = f"{FIREBASE_URL.rstrip('/')}/Highlights/matches.json?auth={FIREBASE_SECRET}"
-    items = list(firebase_payload.items())
-    batch_size = 200
-    total_batches = (len(items) + batch_size - 1) // batch_size
+    existing_data = {}
+    try:
+        res = requests.get(endpoint, timeout=45)
+        if res.status_code == 200:
+            fetched = res.json()
+            if isinstance(fetched, dict):
+                existing_data = fetched
+    except Exception:
+        pass
 
-    success_count = 0
-    for i in range(total_batches):
-        batch_dict = dict(items[i * batch_size : (i + 1) * batch_size])
-        try:
-            res = requests.patch(
-                target_endpoint,
-                data=json.dumps(batch_dict, ensure_ascii=False),
-                headers={"Content-Type": "application/json"},
-                timeout=35,
-            )
-            if res.status_code == 200:
-                success_count += len(batch_dict)
-            else:
-                print(f"[!] Firebase batch {i+1} failed with status code: {res.status_code}")
-        except Exception as e:
-            print(f"[!] Network error on Firebase batch {i+1}: {e}")
+    all_matches_map = {}
 
-    return success_count == len(items)
+    for key, match in existing_data.items():
+        if isinstance(match, dict):
+            base_slug = re.sub(r"^\d+_", "", key)
+            all_matches_map[base_slug] = match
+
+    for slug, match in new_matches_list:
+        all_matches_map[slug] = sanitize_deep_json(match)
+
+    match_tuples = []
+    for slug, match in all_matches_map.items():
+        d_str = match.get("date", "")
+        dt = parse_date(d_str)
+        match_tuples.append((dt, slug, match))
+
+    match_tuples.sort(key=lambda x: x[0], reverse=True)
+
+    total_count = len(match_tuples)
+    digits = max(4, len(str(total_count)))
+    sorted_payload = {}
+
+    for idx, (dt, slug, match) in enumerate(match_tuples, start=1):
+        serial_key = f"{idx:0{digits}d}_{slug}"
+        sorted_payload[serial_key] = match
+
+    try:
+        put_res = requests.put(
+            endpoint,
+            data=json.dumps(sorted_payload, ensure_ascii=False),
+            headers={"Content-Type": "application/json"},
+            timeout=180
+        )
+        if put_res.status_code == 200:
+            newest_match = match_tuples[0][2] if match_tuples else None
+            return True, newest_match
+    except Exception as e:
+        print(f"[!] Upload error: {e}")
+
+    return False, None
 
 
 def main():
@@ -165,7 +199,7 @@ def main():
     print("==========================================")
 
     if not FIREBASE_URL or not FIREBASE_SECRET or not API_BASE_URL:
-        print("[!] Error: Required environment variables (FIREBASE_URL, FIREBASE_SECRET, API_BASE_URL) are missing!")
+        print("[!] Error: Required environment variables are missing!")
         return
 
     chk_slug, chk_title, chk_date = get_last_checkpoint()
@@ -226,13 +260,13 @@ def main():
 
     total_new = len(all_new_matches)
     if total_new > 0:
-        uploaded = upload_to_firebase(all_new_matches)
-        if uploaded:
-            newest_match = all_new_matches[0][1]
+        success, newest_match = sync_and_sort_firebase(all_new_matches)
+        if success and newest_match:
             save_last_checkpoint(newest_match)
-            print(f"[+] Total {total_new} match successfully added in database\n")
+            print(f"[+] Total {total_new} match successfully added in database")
+            print("[+] Full database Sorted with new to old\n")
         else:
-            print("[!] Failed to upload matches to database. Checkpoint not updated.")
+            print("[!] Failed to sync database.")
     else:
         print("[+] No new matches found. Database is up to date.\n")
 
